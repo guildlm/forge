@@ -173,6 +173,8 @@ class InstructionGenerator:
         request_timeout: float = 120.0,
         price_in: float | None = None,
         price_out: float | None = None,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Initialize the generator.
 
@@ -210,6 +212,10 @@ class InstructionGenerator:
             price_out if price_out is not None
             else float(os.environ.get("FORGE_TEACHER_PRICE_OUT", DEFAULT_PRICE_OUT))
         )
+        self.max_tokens = max_tokens
+        # Reasoning models (e.g. gpt-oss) otherwise spend their whole budget on
+        # hidden reasoning and return empty content; "low" keeps answers compact.
+        self.reasoning_effort = reasoning_effort or os.environ.get("FORGE_TEACHER_REASONING_EFFORT")
         #: Running estimate of teacher spend in USD, updated after every online call.
         self.spend_usd: float = 0.0
         self._client: Any | None = None
@@ -508,12 +514,15 @@ class InstructionGenerator:
 
         for attempt in range(1, self.max_retries + 1):
             try:
+                extra = {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
                 response = client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     temperature=self.temperature,
                     timeout=self.request_timeout,
+                    max_tokens=self.max_tokens,
                     response_format={"type": "json_object"},
+                    **extra,
                 )
                 content = response.choices[0].message.content or ""
                 usage = getattr(response, "usage", None)
