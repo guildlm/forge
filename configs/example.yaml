@@ -1,0 +1,42 @@
+# Example Forge pipeline configuration.
+#
+# Run with:  forge run --config configs/example.yaml
+#
+# This config builds a small Go "code guild" dataset. It uses offline teacher
+# generation so it runs end-to-end without a GPU/teacher endpoint. Set
+# generate.offline to false and export FORGE_TEACHER_BASE_URL / _API_KEY / _MODEL
+# to use a real OpenAI-compatible teacher model.
+
+# Which source to discover from (see SOURCE_REGISTRY: github, arxiv).
+source: github
+
+# Source-specific search query.
+query: "language:go stars:>2000 NOT awesome NOT tutorial"
+
+# Maximum number of items to discover.
+max_results: 5
+
+download:
+  output_dir: data/raw
+  max_workers: 4
+
+process:
+  include_extensions: [".go"]
+  min_length: 200
+  max_length: 50000
+  near_dup_threshold: 0.85
+  allow_unknown_license: true
+
+generate:
+  offline: true                 # deterministic synthetic pairs; no network
+  roles:                        # one set of pairs per role, per document
+    - go_explainer
+    - go_reviewer
+  max_pairs_per_doc: 1
+
+build:
+  name: go_guild_v1
+  output_dir: data/datasets
+  val_ratio: 0.1
+  seed: 42
+  formats: ["jsonl"]            # add "parquet" if pyarrow is installed
