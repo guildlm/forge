@@ -91,6 +91,13 @@ for _role in (
         "intermediate engineer, covering purpose, structure, and key mechanisms.",
         "explain what the code does and how its main components fit together",
     ),
+    Role(
+        "go_tester",
+        "You are a Go testing expert. Write thorough, idiomatic table-driven tests "
+        "(using the standard testing package) that cover happy paths, edge cases, "
+        "and error conditions for the given code.",
+        "write a comprehensive table-driven test suite for the code",
+    ),
 ):
     register_role(_role)
 
