@@ -30,7 +30,11 @@ import re
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from src.core.judge import QualityJudge
+    from src.core.verifier import GoVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +129,28 @@ for _role in (
     ),
 ):
     register_role(_role)
+
+
+# --------------------------------------------------------------------------- #
+# Quality-gate bookkeeping
+# --------------------------------------------------------------------------- #
+@dataclass
+class GateStats:
+    """Counters describing what the quality gate did during generation."""
+
+    generated: int = 0
+    verified_dropped: int = 0
+    judged_dropped: int = 0
+    kept: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a plain dictionary of the counters."""
+        return {
+            "generated": self.generated,
+            "verified_dropped": self.verified_dropped,
+            "judged_dropped": self.judged_dropped,
+            "kept": self.kept,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -233,52 +259,160 @@ class InstructionGenerator:
         max_pairs: int | None = None,
         max_spend_usd: float | None = None,
         content_key: str = "content",
+        verifier: GoVerifier | None = None,
+        judge: QualityJudge | None = None,
+        judge_threshold: float = 0.0,
+        rejection_samples: int = 1,
     ) -> list[dict[str, str]]:
-        """Generate pairs across many documents under hard budget caps.
+        """Generate pairs across many documents under hard budget caps and a quality gate.
 
         Iterates ``documents`` x ``roles``, accumulating instruction/response
         pairs. The loop stops *cleanly* (returning whatever was produced so far,
         never raising) as soon as either cap is reached:
 
         * ``max_pairs`` -- stop once this many pairs have been collected.
-        * ``max_spend_usd`` -- stop once the running spend estimate
-          (:pyattr:`spend_usd`, derived from teacher token usage) reaches this.
+        * ``max_spend_usd`` -- stop once the running spend estimate reaches this.
+          When a ``judge`` is supplied, **its** spend counts toward the cap too.
+
+        When any of ``verifier`` / ``judge`` is set or ``rejection_samples > 1``,
+        the *quality gate* is active. For each keep-slot per (document, role) it
+        samples ``rejection_samples`` candidates and keeps the best surviving one:
+
+        * **verify gate** -- candidates whose code fails execution verification
+          (per the verifier's ``strict`` policy) are dropped.
+        * **judge gate** -- candidates scoring below ``judge_threshold`` are
+          dropped; survivors are ranked by judge score (best wins).
+
+        With no gate active this is exactly the original budget-capped behaviour.
 
         Args:
             documents: Iterable of document dicts (or raw strings).
             roles: Teacher role names to apply to each document.
-            max_pairs_per_doc: Pairs requested per (document, role).
+            max_pairs_per_doc: Pairs (keep-slots) per (document, role).
             max_pairs: Optional hard cap on total pairs.
             max_spend_usd: Optional hard cap on estimated spend (USD).
             content_key: Key holding the source content when documents are dicts.
+            verifier: Optional :class:`~src.core.verifier.GoVerifier` gate.
+            judge: Optional :class:`~src.core.judge.QualityJudge` gate.
+            judge_threshold: Minimum judge score to keep a candidate.
+            rejection_samples: Candidates sampled per keep-slot (best survivor wins).
 
         Returns:
             The collected instruction/response/context pairs.
         """
+        gate_active = verifier is not None or judge is not None or rejection_samples > 1
+        stats = GateStats()
         pairs: list[dict[str, str]] = []
+
         for doc in documents:
             content = doc.get(content_key, "") if isinstance(doc, dict) else str(doc)
             for role in roles:
                 if max_pairs is not None and len(pairs) >= max_pairs:
                     logger.info(
                         "Reached max_pairs cap (%d); stopping. Estimated spend ~$%.4f.",
-                        max_pairs, self.spend_usd,
+                        max_pairs, self._total_spend(judge),
                     )
+                    self._log_gate(stats, len(pairs), judge)
                     return pairs
-                if max_spend_usd is not None and self.spend_usd >= max_spend_usd:
+                if max_spend_usd is not None and self._total_spend(judge) >= max_spend_usd:
                     logger.info(
                         "Reached max_spend_usd cap ($%.2f); stopping. Estimated spend ~$%.4f.",
-                        max_spend_usd, self.spend_usd,
+                        max_spend_usd, self._total_spend(judge),
                     )
+                    self._log_gate(stats, len(pairs), judge)
                     return pairs
-                for pair in self.generate_pairs(content, role=role, max_pairs=max_pairs_per_doc):
+
+                if gate_active:
+                    produced = self._gated_pairs(
+                        content, role,
+                        n_keep=max_pairs_per_doc,
+                        rejection_samples=max(1, rejection_samples),
+                        verifier=verifier,
+                        judge=judge,
+                        judge_threshold=judge_threshold,
+                        max_spend_usd=max_spend_usd,
+                        stats=stats,
+                    )
+                else:
+                    produced = self.generate_pairs(content, role=role, max_pairs=max_pairs_per_doc)
+                    stats.generated += len(produced)
+
+                for pair in produced:
                     pairs.append(pair)
                     if max_pairs is not None and len(pairs) >= max_pairs:
                         break
-        logger.info(
-            "Generated %d pair(s); estimated teacher spend ~$%.4f.", len(pairs), self.spend_usd
-        )
+
+        self._log_gate(stats, len(pairs), judge)
         return pairs
+
+    def _total_spend(self, judge: QualityJudge | None) -> float:
+        """Combined teacher + judge spend estimate in USD."""
+        return self.spend_usd + (judge.spend_usd if judge is not None else 0.0)
+
+    def _log_gate(self, stats: GateStats, kept: int, judge: QualityJudge | None) -> None:
+        stats.kept = kept
+        logger.info(
+            "Quality gate: generated=%d verified_dropped=%d judged_dropped=%d kept=%d; "
+            "total estimated spend ~$%.4f.",
+            stats.generated, stats.verified_dropped, stats.judged_dropped, kept,
+            self._total_spend(judge),
+        )
+
+    def _gated_pairs(
+        self,
+        content: str,
+        role: str,
+        *,
+        n_keep: int,
+        rejection_samples: int,
+        verifier: GoVerifier | None,
+        judge: QualityJudge | None,
+        judge_threshold: float,
+        max_spend_usd: float | None,
+        stats: GateStats,
+    ) -> list[dict[str, str]]:
+        """Produce up to ``n_keep`` gated pairs for one (content, role).
+
+        For each keep-slot, sample ``rejection_samples`` candidates, drop those
+        that fail verification or fall below the judge threshold, and keep the
+        best survivor (highest judge score, else the first survivor).
+        """
+        kept: list[dict[str, str]] = []
+        for _slot in range(max(1, n_keep)):
+            survivors: list[dict[str, str]] = []
+            for _sample in range(rejection_samples):
+                if max_spend_usd is not None and self._total_spend(judge) >= max_spend_usd:
+                    break
+                candidates = self.generate_pairs(content, role=role, max_pairs=1)
+                if not candidates:
+                    continue
+                candidate = candidates[0]
+                stats.generated += 1
+
+                if verifier is not None:
+                    result = verifier.verify(candidate.get("response", ""), role=role)
+                    if not result.passed:
+                        stats.verified_dropped += 1
+                        continue
+                    candidate["verify_status"] = result.status
+
+                if judge is not None:
+                    verdict = judge.judge_pair(candidate)
+                    candidate["judge_score"] = verdict.score
+                    if verdict.score < judge_threshold:
+                        stats.judged_dropped += 1
+                        continue
+
+                survivors.append(candidate)
+
+            if not survivors:
+                continue
+            if judge is not None:
+                best = max(survivors, key=lambda p: float(p.get("judge_score", 0.0)))
+            else:
+                best = survivors[0]
+            kept.append(best)
+        return kept
 
     def _update_spend(self, usage: Any) -> float:
         """Update :pyattr:`spend_usd` from a teacher ``usage`` payload.

@@ -25,7 +25,9 @@ from src.core.dataset_builder import DatasetBuilder
 from src.core.discoverer import Discoverer
 from src.core.downloader import Downloader
 from src.core.instruction_gen import InstructionGenerator
+from src.core.judge import QualityJudge
 from src.core.processor import CleaningStats, Processor, scrub_pii
+from src.core.verifier import GoVerifier
 from src.sources import get_source
 
 #: Source names that already yield instruction/response pairs (import route).
@@ -111,6 +113,69 @@ def _clean_pairs(
         for d in cleaned
     ]
     return pairs, stats
+
+
+def _refine_pairs(
+    pairs: list[dict[str, Any]],
+    *,
+    verifier: GoVerifier | None,
+    judge: QualityJudge | None,
+    judge_threshold: float = 0.0,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Apply the quality gate to an existing list of pairs.
+
+    Each pair is execution-verified (dropped per the verifier's strict policy)
+    and/or judge-scored (dropped below ``judge_threshold``). Pairs without a
+    ``role`` key are verified with build/vet only (no ``go test``).
+
+    Returns:
+        ``(kept_pairs, stats)`` where ``stats`` counts what the gate did.
+    """
+    kept: list[dict[str, Any]] = []
+    stats = {"input": len(pairs), "verified_dropped": 0, "judged_dropped": 0, "kept": 0}
+    for pair in pairs:
+        enriched = dict(pair)
+        if verifier is not None:
+            result = verifier.verify(str(enriched.get("response", "")), role=str(enriched.get("role", "")))
+            if not result.passed:
+                stats["verified_dropped"] += 1
+                continue
+            enriched["verify_status"] = result.status
+        if judge is not None:
+            verdict = judge.judge_pair(enriched)
+            enriched["judge_score"] = verdict.score
+            if verdict.score < judge_threshold:
+                stats["judged_dropped"] += 1
+                continue
+        kept.append(enriched)
+    stats["kept"] = len(kept)
+    return kept, stats
+
+
+def _apply_refine_stage(
+    pairs: list[dict[str, Any]], cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Apply an optional top-level ``refine:`` config stage to ``pairs``.
+
+    The ``refine`` block accepts ``verify`` (bool), ``strict_verify`` (bool),
+    ``judge`` (bool), ``judge_threshold`` (float) and ``offline`` (bool). When no
+    ``refine`` block is present the pairs are returned unchanged.
+    """
+    refine_cfg = cfg.get("refine")
+    if not refine_cfg:
+        return pairs
+    offline = refine_cfg.get("offline", cfg.get("generate", {}).get("offline", False))
+    verifier = (
+        GoVerifier(strict=refine_cfg.get("strict_verify", False))
+        if refine_cfg.get("verify", True)
+        else None
+    )
+    judge = QualityJudge(offline=offline) if refine_cfg.get("judge", True) else None
+    kept, stats = _refine_pairs(
+        pairs, verifier=verifier, judge=judge, judge_threshold=refine_cfg.get("judge_threshold", 0.6)
+    )
+    logger.info("Refine stage: %s", stats)
+    return kept
 
 
 @app.callback()
@@ -200,29 +265,76 @@ def generate(
     max_pairs_per_doc: int = typer.Option(1, help="Pairs requested per (document, role)."),
     max_pairs: int | None = typer.Option(None, help="Hard cap: stop after N total pairs."),
     max_spend_usd: float | None = typer.Option(
-        None, help="Hard cap: stop once estimated teacher spend (USD) reaches this."
+        None, help="Hard cap: stop once estimated teacher+judge spend (USD) reaches this."
     ),
-    offline: bool = typer.Option(False, help="Use deterministic offline teacher."),
+    offline: bool = typer.Option(False, help="Use deterministic offline teacher (and judge)."),
+    verify: bool = typer.Option(False, "--verify/--no-verify", help="Execution-verify Go code."),
+    strict_verify: bool = typer.Option(
+        False, "--strict-verify", help="Drop pairs whose code is unverifiable (no toolchain / no code)."
+    ),
+    judge: bool = typer.Option(False, "--judge/--no-judge", help="Rubric-judge and filter pairs."),
+    judge_threshold: float = typer.Option(0.0, help="Minimum judge score to keep a pair."),
+    rejection_samples: int = typer.Option(
+        1, help="Candidates sampled per keep-slot; the best survivor is kept."
+    ),
 ) -> None:
     """Generate instruction/response pairs from documents under budget caps.
 
     With a real teacher, ``--max-pairs`` and ``--max-spend-usd`` cap cost: the
-    loop stops cleanly when either is hit and reports the estimated spend.
+    loop stops cleanly when either is hit and reports the estimated spend. The
+    quality gate (``--verify`` / ``--judge`` / ``--rejection-samples``) verifies
+    that code compiles and filters low-quality pairs; judge spend also counts
+    toward ``--max-spend-usd``.
     """
     documents = _read_json(input)
     roles = [r.strip() for r in role.split(",") if r.strip()]
     gen = InstructionGenerator(offline=offline)
+    verifier = GoVerifier(strict=strict_verify) if verify else None
+    quality_judge = QualityJudge(offline=offline) if judge else None
     pairs = gen.generate_dataset(
         documents,
         roles=roles,
         max_pairs_per_doc=max_pairs_per_doc,
         max_pairs=max_pairs,
         max_spend_usd=max_spend_usd,
+        verifier=verifier,
+        judge=quality_judge,
+        judge_threshold=judge_threshold,
+        rejection_samples=rejection_samples,
     )
     _write_json(output, pairs)
-    typer.echo(
-        f"Generated {len(pairs)} pair(s) (estimated spend ~${gen.spend_usd:.4f}) -> {output}"
+    spend = gen.spend_usd + (quality_judge.spend_usd if quality_judge else 0.0)
+    typer.echo(f"Generated {len(pairs)} pair(s) (estimated spend ~${spend:.4f}) -> {output}")
+
+
+@app.command()
+def refine(
+    input: Path = typer.Option(..., help="JSON file of existing instruction pairs."),
+    output: Path = typer.Option(Path("data/refined.json"), help="Kept pairs JSON path."),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Execution-verify Go code."),
+    strict_verify: bool = typer.Option(
+        False, "--strict-verify", help="Drop pairs whose code is unverifiable (no toolchain / no code)."
+    ),
+    judge: bool = typer.Option(True, "--judge/--no-judge", help="Rubric-judge and filter pairs."),
+    judge_threshold: float = typer.Option(0.6, help="Minimum judge score to keep a pair."),
+    offline: bool = typer.Option(False, help="Use the deterministic offline judge."),
+) -> None:
+    """Apply the quality gate to an EXISTING pairs file (verify + judge).
+
+    Runs the same gate as ``forge generate`` over pairs you already have -- e.g.
+    Route-A curated data -- so any dataset can be filtered to verified, judged
+    pairs. Reads/writes the Forge pairs JSON schema.
+    """
+    pairs = _read_json(input)
+    verifier = GoVerifier(strict=strict_verify) if verify else None
+    quality_judge = QualityJudge(offline=offline) if judge else None
+    kept, stats = _refine_pairs(
+        pairs, verifier=verifier, judge=quality_judge, judge_threshold=judge_threshold
     )
+    _write_json(output, kept)
+    spend = quality_judge.spend_usd if quality_judge else 0.0
+    typer.echo(f"Refined {stats['kept']}/{stats['input']} pair(s) [{stats}] "
+               f"(estimated judge spend ~${spend:.4f}) -> {output}")
 
 
 @app.command()
@@ -294,6 +406,7 @@ def _run_import_pipeline(cfg: dict[str, Any], source_name: str):
         max_length=proc_cfg.get("max_length", 20_000),
         near_dup_threshold=proc_cfg.get("near_dup_threshold", 0.85),
     )
+    pairs = _apply_refine_stage(pairs, cfg)
     builder = DatasetBuilder(build_cfg.get("output_dir", "data/datasets"))
     return builder.build(
         pairs,
@@ -337,15 +450,27 @@ def _run_generate_pipeline(cfg: dict[str, Any], source_name: str):
             raw_docs.extend(processor.process_repository(result.local_path, license=result.extra.get("license")))
     documents, clean_stats = processor.clean(raw_docs)
 
-    generator = InstructionGenerator(offline=gen_cfg.get("offline", False))
+    offline = gen_cfg.get("offline", False)
+    generator = InstructionGenerator(offline=offline)
+    verifier = (
+        GoVerifier(strict=gen_cfg.get("strict_verify", False))
+        if gen_cfg.get("verify", False)
+        else None
+    )
+    judge = QualityJudge(offline=offline) if gen_cfg.get("judge", False) else None
     pairs = generator.generate_dataset(
         documents,
         roles=gen_cfg.get("roles", ["go_explainer"]),
         max_pairs_per_doc=gen_cfg.get("max_pairs_per_doc", 1),
         max_pairs=gen_cfg.get("max_pairs"),
         max_spend_usd=gen_cfg.get("max_spend_usd"),
+        verifier=verifier,
+        judge=judge,
+        judge_threshold=gen_cfg.get("judge_threshold", 0.0),
+        rejection_samples=gen_cfg.get("rejection_samples", 1),
     )
 
+    pairs = _apply_refine_stage(pairs, cfg)
     builder = DatasetBuilder(build_cfg.get("output_dir", "data/datasets"))
     return builder.build(
         pairs,

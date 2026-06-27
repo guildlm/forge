@@ -199,6 +199,65 @@ estimated live from the teacher's reported token usage.
 
 ---
 
+## Quality gate — verified, judged data
+
+Teacher output is *plausible*, not *guaranteed*. For code datasets the single
+biggest quality lever is **execution verification**: actually compiling every
+code example (and running tests for the tester role) instead of trusting that it
+looks right. Forge adds a two-stage gate on top of generation:
+
+1. **Execution verification** (`src/core/verifier.py`) — extract the Go from each
+   teacher response, write it to a throwaway module, and run the local `go`
+   toolchain: `go build ./...` and `go vet ./...`, plus `go test ./...` for the
+   `go_tester` role. Candidates whose code does not compile are dropped. This is
+   best-effort: if `go` is not on `PATH` the verifier reports `unavailable`
+   instead of crashing, and `--strict-verify` controls whether unverifiable
+   pairs are dropped or kept.
+2. **Rubric judge** (`src/core/judge.py`) — a *cheap* LLM grades each surviving
+   pair on correctness, idiomatic Go, completeness, and instruction↔response
+   alignment, producing an overall score in `[0, 1]`. Pairs below
+   `--judge-threshold` are dropped.
+
+With **rejection sampling** (`--rejection-samples K`) Forge generates `K`
+candidates per slot and keeps the best survivor (must pass verification; ranked
+by judge score). All existing budget caps still apply, and **judge spend now
+counts toward `--max-spend-usd`** too.
+
+```bash
+# Generate with the full gate.
+forge generate --input data/documents.json --role go_reviewer,go_tester \
+               --verify --judge --judge-threshold 0.6 --rejection-samples 2 \
+               --max-spend-usd 4.0 --output data/pairs.json
+
+# Or curate an EXISTING pairs file (e.g. Route-A data) through the same gate.
+forge refine --input data/go_curated.json --output data/go_verified.json \
+             --verify --judge --judge-threshold 0.6
+```
+
+| Flag (`generate` / `refine`) | Meaning | Default |
+| --- | --- | --- |
+| `--verify` / `--no-verify` | Compile-check extracted Go with the local toolchain. | off / on |
+| `--strict-verify` | Drop pairs that can't be verified (no toolchain / no code). | off |
+| `--judge` / `--no-judge` | Rubric-judge and filter pairs with a cheap LLM. | off / on |
+| `--judge-threshold` | Minimum overall judge score to keep a pair. | `0.0` / `0.6` |
+| `--rejection-samples` | Candidates per slot; the best survivor is kept (`generate` only). | `1` |
+
+The judge reuses the teacher endpoint config and adds optional `FORGE_JUDGE_*`
+overrides (`FORGE_JUDGE_BASE_URL`, `FORGE_JUDGE_API_KEY`, `FORGE_JUDGE_MODEL`,
+`FORGE_JUDGE_PRICE_IN`, `FORGE_JUDGE_PRICE_OUT`); each falls back to the matching
+`FORGE_TEACHER_*` value. Both stages have a deterministic `offline` mode so tests
+and CI run with no network and no Go required.
+
+**Recommended real recipe.** `configs/go_reviewer_real.yaml` now enables the gate
+by default — `verify: true`, `judge: true`, `judge_threshold: 0.6`,
+`rejection_samples: 2`. This is the recommended Route-B quality recipe.
+
+**Be honest about what this buys you.** Verification *guarantees the code
+compiles* (and that tests pass for the tester role) — nothing more. The judge
+raises *average* quality but is itself a cheap model, not an oracle: it reduces
+obvious junk, it does not certify correctness. We make **no benchmark claims** —
+measure downstream.
+
 ## Config schema (`forge run`)
 
 `forge run` supports two routes via `mode` (auto-detected from the source):
@@ -227,7 +286,20 @@ generate:
   roles: [go_explainer, go_reviewer] # one set of pairs per role, per document
   max_pairs_per_doc: 1
   max_pairs: 4000                    # optional hard cap: stop after N pairs
-  max_spend_usd: 4.0                 # optional hard cap: stop at this estimated spend
+  max_spend_usd: 4.0                 # optional hard cap: stop at this estimated spend (teacher+judge)
+  verify: false                      # execution-verify Go code with the local toolchain
+  strict_verify: false               # drop pairs that can't be verified
+  judge: false                       # rubric-judge and filter pairs
+  judge_threshold: 0.0               # minimum judge score to keep a pair
+  rejection_samples: 1               # candidates per slot; keep the best survivor
+
+# Optional top-level stage: apply the quality gate to the produced pairs (works
+# for both the generate and import routes — e.g. to curate Route-A data).
+refine:
+  verify: true
+  strict_verify: false
+  judge: true
+  judge_threshold: 0.6
 
 build:
   name: go_guild_v1

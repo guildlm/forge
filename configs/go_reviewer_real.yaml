@@ -49,7 +49,14 @@ generate:
     - go_explainer
   max_pairs_per_doc: 1
   max_pairs: 4000               # hard cap: stop after this many pairs
-  max_spend_usd: 4.0            # hard cap: stop once estimated spend hits $4
+  max_spend_usd: 4.0            # hard cap: stop once estimated teacher+judge spend hits $4
+
+  # --- Quality gate (the recommended real-quality recipe) ----------------- #
+  verify: true                  # execution-verify every code example with `go`
+  strict_verify: false          # keep pairs the local toolchain can't check (best-effort)
+  judge: true                   # rubric-judge each pair with a cheap LLM grader
+  judge_threshold: 0.6          # drop pairs scoring below 0.6 overall
+  rejection_samples: 2          # sample 2 candidates per slot, keep the best survivor
 
 build:
   name: go_code_guild_real_v1
