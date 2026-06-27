@@ -44,6 +44,8 @@ Runner = Callable[..., "tuple[int, str]"]
 
 _GO_FENCE = re.compile(r"```go\b[^\n]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _ANY_FENCE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# Detects an unfenced response that is itself Go source.
+_RAW_GO = re.compile(r"^\s*package\s+\w+.*\bfunc\b", re.DOTALL)
 _TEST_MARKER = re.compile(r'^\s*func\s+(?:Test|Benchmark|Example|Fuzz)\w*\s*\(', re.MULTILINE)
 _TESTING_IMPORT = re.compile(r'"testing"')
 
@@ -53,7 +55,10 @@ def extract_go_code(text: str) -> list[str]:
 
     Prefers explicitly tagged ```` ```go ```` fences; if there are none, falls
     back to any fenced ```` ``` ```` block (teachers sometimes omit the language
-    tag). Only the inner code is returned, with surrounding blank lines trimmed.
+    tag); as a last resort, if the *whole* response is unfenced but looks like Go
+    source (declares a ``package`` and at least one ``func``), the entire text is
+    treated as one block. Only the inner code is returned, with surrounding blank
+    lines trimmed.
 
     Args:
         text: The raw teacher response.
@@ -68,7 +73,13 @@ def extract_go_code(text: str) -> list[str]:
     if blocks:
         return blocks
     fallback = [b.strip("\n") for b in _ANY_FENCE.findall(text)]
-    return [b for b in fallback if b.strip()]
+    fallback = [b for b in fallback if b.strip()]
+    if fallback:
+        return fallback
+    # Last resort: many teachers return the answer as raw Go with no fences.
+    if _RAW_GO.search(text):
+        return [text.strip("\n")]
+    return []
 
 
 def _looks_like_test(block: str) -> bool:
