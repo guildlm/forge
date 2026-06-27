@@ -44,7 +44,7 @@ Everything domain-specific is isolated:
 git clone https://github.com/guildlm/forge.git
 cd forge
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'          # add ',parquet' for Parquet export
+pip install -e '.[dev]'          # add ',parquet' for Parquet, ',hf' for dataset curation
 
 pytest -q                        # tests run fully offline
 ```
@@ -86,6 +86,33 @@ forge generate --input data/documents.json --role go_explainer \
 forge build    --input data/pairs.json --name go_guild_v1 --val-ratio 0.1
 ```
 
+`forge generate` accepts a comma-separated `--role` list and **hard budget
+caps** for cost control (see below):
+
+```bash
+forge generate --input data/documents.json --role go_reviewer,go_generator \
+               --max-pairs-per-doc 1 --max-pairs 4000 --max-spend-usd 4.0 \
+               --output data/pairs.json
+```
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--max-pairs-per-doc` | Pairs requested per (document, role). | `1` |
+| `--max-pairs` | Hard cap: stop after N total pairs. | unset |
+| `--max-spend-usd` | Hard cap: stop once estimated teacher spend (USD) hits this. | unset |
+
+Generation stops *cleanly* at whichever cap is hit first and still writes
+whatever it produced. Spend is estimated from the teacher's reported token usage.
+
+There is also a `$0` curation route that skips the teacher entirely:
+
+```bash
+# Curate an existing open dataset, filter to Go, clean -> ready-to-build pairs.
+forge import --dataset ise-uiuc/Magicoder-OSS-Instruct-75K --split train \
+             --language go --max 3000 --output data/go_curated.json
+forge build  --input data/go_curated.json --name go_curated_v1
+```
+
 ### Teacher model configuration
 
 Online generation talks to any OpenAI-compatible endpoint (vLLM, TGI, OpenAI,
@@ -96,16 +123,91 @@ Together, ...) via the `openai` SDK. Configure it with environment variables:
 | `FORGE_TEACHER_BASE_URL` | OpenAI-compatible base URL | `http://localhost:8000/v1` |
 | `FORGE_TEACHER_API_KEY` | API key (any non-empty string for local servers) | `not-needed` |
 | `FORGE_TEACHER_MODEL` | Model identifier | `teacher` |
+| `FORGE_TEACHER_PRICE_IN` | USD per 1M input tokens (cost estimation) | `0.14` |
+| `FORGE_TEACHER_PRICE_OUT` | USD per 1M output tokens (cost estimation) | `0.28` |
 
 Drop `--offline` to use it. The offline mode produces deterministic synthetic
-pairs so tests and CI never need a network or a teacher model.
+pairs so tests and CI never need a network or a teacher model. The price
+defaults track DeepSeek-V3 (`deepseek-chat`) and drive the `--max-spend-usd` cap.
+
+---
+
+## Building a real dataset cheaply
+
+The example config is an offline smoke-test. To produce a **real,
+training-quality Go SFT dataset** there are two cheap routes — build either or
+both. Both are honest: curated and teacher-generated data is genuinely useful
+for fine-tuning. (We make no benchmark claims here — measure downstream.)
+
+### Route A — curate existing open datasets (`$0`)
+
+Reuse high-quality, already-instruction-tuned datasets from the HuggingFace Hub.
+No teacher, no GPU, no spend. Needs the `datasets` library:
+
+```bash
+pip install 'guildlm-forge[hf]'
+
+# Stream the dataset, keep only Go rows, clean (dedup/PII/length), write pairs.
+forge import --dataset ise-uiuc/Magicoder-OSS-Instruct-75K --split train \
+             --language go --max 3000 --output data/go_curated.json
+forge build  --input data/go_curated.json --name go_curated_v1
+```
+
+Datasets are **streamed** (`streaming=True`) and stop as soon as `--max` matching
+rows are collected, so multi-million-row datasets are never materialized. The
+row-normalizer maps the common field conventions (`{instruction, output}`,
+`{problem, solution}`, `{prompt, completion}`, chat `{messages: [...]}`, Alpaca
+`{instruction, input, output}`) onto Forge's pair schema, and the language filter
+keeps Go rows via an explicit `lang`/`language` field or a Go-source heuristic.
+
+Recommended sources:
+
+| Dataset | Notes |
+| --- | --- |
+| `ise-uiuc/Magicoder-OSS-Instruct-75K` | OSS-Instruct pairs; has a `lang` field — filter to Go. |
+| `nvidia/OpenCodeInstruct` | ~5M rows, CC-BY-4.0; stream and filter to Go. |
+
+The whole curate → clean → build flow also runs from one config (`mode: import`,
+auto-detected for `source: hf_datasets`) — see `configs/go_curated.yaml`:
+
+```bash
+forge run --config configs/go_curated.yaml
+```
+
+### Route B — generate grounded pairs with a cheap teacher (~`$2-3`)
+
+Discover top idiomatic Go repos, then prompt a cheap OpenAI-compatible teacher to
+invent OSS-Instruct-style problems grounded in real snippets and answer them
+idiomatically (concrete reviews, idiomatic code, table-driven tests, clear
+explanations). Use **DeepSeek-V3**, which is strong and cheap:
+
+```bash
+export FORGE_TEACHER_BASE_URL=https://api.deepseek.com
+export FORGE_TEACHER_MODEL=deepseek-chat
+export FORGE_TEACHER_API_KEY=sk-...        # your DeepSeek key
+export GITHUB_TOKEN=ghp_...                # lifts the 60 req/hr GitHub limit
+
+forge run --config configs/go_reviewer_real.yaml
+```
+
+**Cost math.** DeepSeek-V3 is ~`$0.14` / `$1M` input and `$0.28` / `$1M` output
+tokens. A grounded pair is roughly ~1–2k input + ~0.5–1k output tokens, i.e. a
+fraction of a cent each; a few thousand pairs lands around **`$2-3`**. The recipe
+hard-caps spend at `max_spend_usd: 4.0` and `max_pairs: 4000` — generation stops
+cleanly at whichever is hit first and still builds whatever it made. Spend is
+estimated live from the teacher's reported token usage.
 
 ---
 
 ## Config schema (`forge run`)
 
+`forge run` supports two routes via `mode` (auto-detected from the source):
+`generate` (discover → download → process → teacher → build) and `import`
+(curate an existing instruction dataset; the teacher stage is skipped).
+
 ```yaml
-source: github                       # registered source name (github | arxiv)
+source: github                       # registered source name (github | arxiv | hf_datasets)
+mode: generate                       # generate | import (auto: import for hf_datasets)
 query: "language:go stars:>2000"     # source-specific search expression
 max_results: 5                       # cap on discovered items
 
@@ -124,6 +226,8 @@ generate:
   offline: true                      # deterministic synthetic pairs
   roles: [go_explainer, go_reviewer] # one set of pairs per role, per document
   max_pairs_per_doc: 1
+  max_pairs: 4000                    # optional hard cap: stop after N pairs
+  max_spend_usd: 4.0                 # optional hard cap: stop at this estimated spend
 
 build:
   name: go_guild_v1
@@ -131,6 +235,23 @@ build:
   val_ratio: 0.1
   seed: 42
   formats: ["jsonl"]                 # add "parquet" if pyarrow is installed
+```
+
+For `mode: import` (e.g. `source: hf_datasets`) the `download`/`generate`
+sections are unused; instead provide the dataset keys:
+
+```yaml
+source: hf_datasets
+mode: import                         # auto-detected for hf_datasets
+dataset: ise-uiuc/Magicoder-OSS-Instruct-75K   # HuggingFace dataset id
+split: train                         # dataset split to stream
+language: go                         # language to keep
+max_records: 3000                    # stop after this many matching pairs
+process:                             # dedup/PII/length over the pair text
+  min_length: 40
+  max_length: 20000
+  near_dup_threshold: 0.85
+build: { name: go_curated_v1, val_ratio: 0.1 }
 ```
 
 ---

@@ -11,6 +11,7 @@ from collections.abc import Callable
 from src.sources.arxiv import ArxivSource
 from src.sources.base import Source, SourceProtocol, SourceRecord
 from src.sources.github import GitHubSource
+from src.sources.hf_datasets import HFDatasetsSource
 
 __all__ = [
     "Source",
@@ -18,6 +19,7 @@ __all__ = [
     "SourceRecord",
     "GitHubSource",
     "ArxivSource",
+    "HFDatasetsSource",
     "SOURCE_REGISTRY",
     "get_source",
     "register_source",
@@ -27,6 +29,7 @@ __all__ = [
 SOURCE_REGISTRY: dict[str, Callable[[], Source]] = {
     GitHubSource.name: GitHubSource,
     ArxivSource.name: ArxivSource,
+    HFDatasetsSource.name: HFDatasetsSource,
 }
 
 

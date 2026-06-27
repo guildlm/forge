@@ -1,0 +1,59 @@
+# Real-quality Go SFT recipe for the Code Guild (Route B: teacher generation).
+#
+# This discovers top idiomatic Go repositories, cleans the source, and prompts a
+# CHEAP OpenAI-compatible teacher (DeepSeek-V3) to produce grounded, OSS-Instruct
+# -style instruction/response pairs for all four Code Guild roles.
+#
+# 1. Point Forge at the DeepSeek API (https://platform.deepseek.com):
+#
+#      export FORGE_TEACHER_BASE_URL=https://api.deepseek.com
+#      export FORGE_TEACHER_MODEL=deepseek-chat
+#      export FORGE_TEACHER_API_KEY=sk-...           # your DeepSeek key
+#      export GITHUB_TOKEN=ghp_...                   # lifts the 60 req/hr limit
+#
+#    Pricing defaults already track DeepSeek-V3 ($0.14 / $0.28 per 1M in/out
+#    tokens). Override with FORGE_TEACHER_PRICE_IN / FORGE_TEACHER_PRICE_OUT.
+#
+# 2. Run it:
+#
+#      forge run --config configs/go_reviewer_real.yaml
+#
+# Expected cost: a few thousand pairs typically lands around $2-3 and is hard-
+# capped at $4.00 below (max_spend_usd) and at 4000 pairs (max_pairs); generation
+# stops cleanly at whichever cap is hit first and still builds whatever it made.
+
+source: github
+mode: generate
+
+# Top, idiomatic, well-maintained Go repos; exclude tutorial/awesome noise.
+query: "language:go stars:>3000 NOT awesome NOT tutorial NOT example"
+max_results: 25
+
+download:
+  output_dir: data/raw
+  max_workers: 4
+
+process:
+  include_extensions: [".go"]
+  min_length: 300
+  max_length: 16000
+  near_dup_threshold: 0.85
+  allow_unknown_license: true
+
+generate:
+  offline: false                # talk to the real DeepSeek teacher
+  roles:                        # one set of pairs per role, per document
+    - go_reviewer
+    - go_generator
+    - go_tester
+    - go_explainer
+  max_pairs_per_doc: 1
+  max_pairs: 4000               # hard cap: stop after this many pairs
+  max_spend_usd: 4.0            # hard cap: stop once estimated spend hits $4
+
+build:
+  name: go_code_guild_real_v1
+  output_dir: data/datasets
+  val_ratio: 0.1
+  seed: 42
+  formats: ["jsonl"]            # add "parquet" if pyarrow is installed

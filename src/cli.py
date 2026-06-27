@@ -25,7 +25,11 @@ from src.core.dataset_builder import DatasetBuilder
 from src.core.discoverer import Discoverer
 from src.core.downloader import Downloader
 from src.core.instruction_gen import InstructionGenerator
-from src.core.processor import Processor
+from src.core.processor import CleaningStats, Processor, scrub_pii
+from src.sources import get_source
+
+#: Source names that already yield instruction/response pairs (import route).
+IMPORT_SOURCES: frozenset[str] = frozenset({"hf_datasets"})
 
 app = typer.Typer(
     add_completion=False,
@@ -51,6 +55,64 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _clean_pairs(
+    raw_pairs: list[dict[str, Any]],
+    *,
+    min_length: int = 40,
+    max_length: int = 20_000,
+    near_dup_threshold: float = 0.85,
+) -> tuple[list[dict[str, Any]], CleaningStats]:
+    """Scrub and clean imported instruction pairs, reusing :class:`Processor`.
+
+    PII/secret scrubbing is applied to each pair field with the processor's
+    :func:`scrub_pii`; exact/near deduplication, length and printability filters
+    are delegated to :class:`Processor` over the combined pair text.
+
+    Args:
+        raw_pairs: Pairs with ``instruction``/``response``/``context`` keys.
+        min_length: Minimum combined-pair length in characters.
+        max_length: Maximum combined-pair length in characters.
+        near_dup_threshold: MinHash similarity above which pairs are dropped.
+
+    Returns:
+        ``(clean_pairs, stats)`` where ``stats`` carries the cleaning counters
+        (with ``pii_redactions`` reflecting the field-level scrubbing).
+    """
+    processor = Processor(
+        min_length=min_length,
+        max_length=max_length,
+        near_dup_threshold=near_dup_threshold,
+        allow_unknown_license=True,
+        scrub=False,  # we scrub each field below to keep them individually clean
+    )
+    redactions = 0
+    docs: list[dict[str, Any]] = []
+    for pair in raw_pairs:
+        instruction, n_i = scrub_pii(str(pair.get("instruction", "")))
+        response, n_r = scrub_pii(str(pair.get("response", "")))
+        context, n_c = scrub_pii(str(pair.get("context", "")))
+        if not instruction.strip() or not response.strip():
+            continue
+        redactions += n_i + n_r + n_c
+        combined = "\n\n".join(part for part in (instruction, context, response) if part)
+        docs.append(
+            {
+                "instruction": instruction,
+                "response": response,
+                "context": context,
+                "content": combined,
+                "license": None,
+            }
+        )
+    cleaned, stats = processor.clean(docs)
+    stats.pii_redactions = redactions
+    pairs = [
+        {"instruction": d["instruction"], "response": d["response"], "context": d["context"]}
+        for d in cleaned
+    ]
+    return pairs, stats
+
+
 @app.callback()
 def _main(verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging.")) -> None:
     """Global options."""
@@ -68,6 +130,32 @@ def discover(
     records = Discoverer().discover(source, query, max_results=max_results)
     _write_json(output, records)
     typer.echo(f"Discovered {len(records)} record(s) -> {output}")
+
+
+@app.command(name="import")
+def import_dataset(
+    dataset: str = typer.Option(..., help="HuggingFace dataset id, e.g. ise-uiuc/Magicoder-OSS-Instruct-75K."),
+    split: str = typer.Option("train", help="Dataset split to stream."),
+    language: str = typer.Option("go", help="Programming language to keep."),
+    max_records: int = typer.Option(3000, "--max", help="Max matching pairs to collect."),
+    output: Path = typer.Option(Path("data/curated.json"), help="Output pairs JSON path."),
+    min_length: int = typer.Option(40, help="Min combined-pair length (chars)."),
+    max_length: int = typer.Option(20_000, help="Max combined-pair length (chars)."),
+    near_dup_threshold: float = typer.Option(0.85, help="Near-dup MinHash threshold."),
+) -> None:
+    """Import an existing HuggingFace instruction dataset ($0 curation route).
+
+    Streams the dataset, normalizes rows to Forge pairs, keeps only the requested
+    language, runs the processor (dedup/PII/length), and writes pairs ready for
+    ``forge build``.
+    """
+    source = get_source("hf_datasets")
+    raw = source.search(dataset, max_results=max_records, split=split, language=language)
+    pairs, stats = _clean_pairs(
+        raw, min_length=min_length, max_length=max_length, near_dup_threshold=near_dup_threshold
+    )
+    _write_json(output, pairs)
+    typer.echo(f"Imported {len(pairs)} pair(s) [{stats.to_dict()}] -> {output}")
 
 
 @app.command()
@@ -108,18 +196,33 @@ def process(
 def generate(
     input: Path = typer.Option(..., help="JSON file of clean documents."),
     output: Path = typer.Option(Path("data/pairs.json"), help="Pairs JSON path."),
-    role: str = typer.Option("go_explainer", help="Teacher role."),
-    max_pairs: int = typer.Option(1, help="Pairs per document."),
+    role: str = typer.Option("go_explainer", help="Teacher role (comma-separated for several)."),
+    max_pairs_per_doc: int = typer.Option(1, help="Pairs requested per (document, role)."),
+    max_pairs: int | None = typer.Option(None, help="Hard cap: stop after N total pairs."),
+    max_spend_usd: float | None = typer.Option(
+        None, help="Hard cap: stop once estimated teacher spend (USD) reaches this."
+    ),
     offline: bool = typer.Option(False, help="Use deterministic offline teacher."),
 ) -> None:
-    """Generate instruction/response pairs from documents."""
+    """Generate instruction/response pairs from documents under budget caps.
+
+    With a real teacher, ``--max-pairs`` and ``--max-spend-usd`` cap cost: the
+    loop stops cleanly when either is hit and reports the estimated spend.
+    """
     documents = _read_json(input)
+    roles = [r.strip() for r in role.split(",") if r.strip()]
     gen = InstructionGenerator(offline=offline)
-    pairs: list[dict[str, Any]] = []
-    for doc in documents:
-        pairs.extend(gen.generate_pairs(doc.get("content", ""), role=role, max_pairs=max_pairs))
+    pairs = gen.generate_dataset(
+        documents,
+        roles=roles,
+        max_pairs_per_doc=max_pairs_per_doc,
+        max_pairs=max_pairs,
+        max_spend_usd=max_spend_usd,
+    )
     _write_json(output, pairs)
-    typer.echo(f"Generated {len(pairs)} pair(s) -> {output}")
+    typer.echo(
+        f"Generated {len(pairs)} pair(s) (estimated spend ~${gen.spend_usd:.4f}) -> {output}"
+    )
 
 
 @app.command()
@@ -153,15 +256,64 @@ def run(config: Path = typer.Option(..., help="YAML pipeline config.")) -> None:
 def run_pipeline(cfg: dict[str, Any]):
     """Execute the end-to-end pipeline from a parsed config dict.
 
+    Two routes are supported, selected by ``mode`` (or auto-detected from the
+    source):
+
+    * ``import`` -- curate an existing instruction dataset (e.g. ``hf_datasets``):
+      the source already yields pairs, so teacher generation is skipped.
+    * ``generate`` -- the classic discover -> download -> process -> generate
+      -> build flow with a teacher model.
+
     Returns the resulting :class:`~src.core.dataset_builder.BuildManifest`.
     """
+    source_name = cfg.get("source", "github")
+    mode = cfg.get("mode") or ("import" if source_name in IMPORT_SOURCES else "generate")
+    if mode == "import":
+        return _run_import_pipeline(cfg, source_name)
+    return _run_generate_pipeline(cfg, source_name)
+
+
+def _run_import_pipeline(cfg: dict[str, Any], source_name: str):
+    """Curate an existing instruction dataset into a built Forge dataset."""
+    proc_cfg = cfg.get("process", {})
+    build_cfg = cfg.get("build", {})
+    dataset = cfg.get("dataset") or cfg.get("query")
+    if not dataset:
+        raise ValueError("import mode requires a 'dataset' (or 'query') key in the config")
+
+    raw_pairs = Discoverer().discover(
+        source_name,
+        dataset,
+        max_results=cfg.get("max_records", cfg.get("max_results", 3000)),
+        split=cfg.get("split", "train"),
+        language=cfg.get("language", "go"),
+    )
+    pairs, stats = _clean_pairs(
+        raw_pairs,
+        min_length=proc_cfg.get("min_length", 40),
+        max_length=proc_cfg.get("max_length", 20_000),
+        near_dup_threshold=proc_cfg.get("near_dup_threshold", 0.85),
+    )
+    builder = DatasetBuilder(build_cfg.get("output_dir", "data/datasets"))
+    return builder.build(
+        pairs,
+        build_cfg.get("name", "forge_curated"),
+        val_ratio=build_cfg.get("val_ratio", 0.1),
+        seed=build_cfg.get("seed", 42),
+        formats=build_cfg.get("formats", ["jsonl"]),
+        source_stats=stats.to_dict(),
+    )
+
+
+def _run_generate_pipeline(cfg: dict[str, Any], source_name: str):
+    """Classic discover -> download -> process -> generate -> build flow."""
     dl_cfg = cfg.get("download", {})
     proc_cfg = cfg.get("process", {})
     gen_cfg = cfg.get("generate", {})
     build_cfg = cfg.get("build", {})
 
     records = Discoverer().discover(
-        cfg.get("source", "github"),
+        source_name,
         cfg["query"],
         max_results=cfg.get("max_results", 10),
     )
@@ -186,12 +338,13 @@ def run_pipeline(cfg: dict[str, Any]):
     documents, clean_stats = processor.clean(raw_docs)
 
     generator = InstructionGenerator(offline=gen_cfg.get("offline", False))
-    roles = gen_cfg.get("roles", ["go_explainer"])
-    max_pairs = gen_cfg.get("max_pairs_per_doc", 1)
-    pairs: list[dict[str, Any]] = []
-    for doc in documents:
-        for role in roles:
-            pairs.extend(generator.generate_pairs(doc["content"], role=role, max_pairs=max_pairs))
+    pairs = generator.generate_dataset(
+        documents,
+        roles=gen_cfg.get("roles", ["go_explainer"]),
+        max_pairs_per_doc=gen_cfg.get("max_pairs_per_doc", 1),
+        max_pairs=gen_cfg.get("max_pairs"),
+        max_spend_usd=gen_cfg.get("max_spend_usd"),
+    )
 
     builder = DatasetBuilder(build_cfg.get("output_dir", "data/datasets"))
     return builder.build(

@@ -27,9 +27,11 @@ dependencies = [
 
 [project.optional-dependencies]
 parquet = ["pyarrow>=14.0"]
+hf = ["datasets>=2.14"]
 dev = [
     "pytest>=7.4",
     "ruff>=0.4",
+    "datasets>=2.14",
 ]
 
 [project.scripts]

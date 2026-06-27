@@ -7,7 +7,9 @@
 # generate.offline to false and export FORGE_TEACHER_BASE_URL / _API_KEY / _MODEL
 # to use a real OpenAI-compatible teacher model.
 
-# Which source to discover from (see SOURCE_REGISTRY: github, arxiv).
+# Which source to discover from (see SOURCE_REGISTRY: github, arxiv, hf_datasets).
+# For a $0 curated dataset see configs/go_curated.yaml; for a real teacher-
+# generated one see configs/go_reviewer_real.yaml.
 source: github
 
 # Source-specific search query.

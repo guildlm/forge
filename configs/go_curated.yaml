@@ -1,0 +1,33 @@
+# $0 Go SFT recipe for the Code Guild (Route A: curate an existing dataset).
+#
+# This curates Magicoder-OSS-Instruct-75K, keeps only Go rows, cleans them
+# (dedup/PII/length), and builds a dataset -- no teacher model, no GPU, no spend.
+#
+#   pip install 'guildlm-forge[hf]'        # installs the `datasets` library
+#   forge run --config configs/go_curated.yaml
+#
+# Equivalent piecewise flow:
+#   forge import --dataset ise-uiuc/Magicoder-OSS-Instruct-75K --language go \
+#                --max 3000 --output data/go_curated.json
+#   forge build  --input data/go_curated.json --name go_curated_v1
+
+source: hf_datasets
+mode: import                              # source already yields pairs; skip teacher
+
+# The HuggingFace dataset id and split to stream.
+dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+split: train
+language: go
+max_records: 3000                         # stop after this many Go pairs
+
+process:
+  min_length: 40                          # min combined-pair length (chars)
+  max_length: 20000
+  near_dup_threshold: 0.85
+
+build:
+  name: go_curated_v1
+  output_dir: data/datasets
+  val_ratio: 0.1
+  seed: 42
+  formats: ["jsonl"]
